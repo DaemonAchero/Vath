@@ -22,10 +22,14 @@ class VathsMirror {
         this.headless = options.headless ?? 'new';
         this.simulateUser = options.simulateUser ?? true;
         this.waitForUser = options.waitForUser ?? false;
+        this.waitForSignal = options.waitForSignal ?? null;
         this.captureWebGL = options.captureWebGL ?? true;
         this.captureCanvas = options.captureCanvas ?? true;
         this.deepCrawl = options.deepCrawl ?? false;
         this.maxDepth = options.maxDepth || 3;
+        this.lockUrl = options.lockUrl ?? true;
+        this.interceptRequests = options.interceptRequests ?? true;
+        this.autoManualOnGsap = options.autoManualOnGsap ?? false;
         this.viewports = [
             { width: 1920, height: 1080, name: 'desktop', deviceScaleFactor: 1 },
             { width: 1366, height: 768, name: 'laptop', deviceScaleFactor: 1 },
@@ -81,6 +85,9 @@ class VathsMirror {
 
     // Utility: Wait for keypress in headed mode
     waitForEnter() {
+        if (typeof this.waitForSignal === 'function') {
+            return this.waitForSignal();
+        }
         return new Promise((resolve) => {
             const readline = require('readline');
             const rl = readline.createInterface({ 
@@ -193,6 +200,51 @@ class VathsMirror {
 
         try {
             const page = await browser.newPage();
+            let failedRequests = 0;
+            let consoleErrors = 0;
+            const originalUrl = url;
+            const normalizeLockUrl = (value) => {
+                try {
+                    const parsed = new URL(value);
+                    let path = parsed.pathname || '/';
+                    if (path.length > 1) path = path.replace(/\/+$/, '');
+                    return `${parsed.origin}${path}`;
+                } catch {
+                    return value;
+                }
+            };
+            const isSameLockUrl = (a, b) => normalizeLockUrl(a) === normalizeLockUrl(b);
+
+            if (this.lockUrl) {
+                await page.evaluateOnNewDocument((lockedUrl) => {
+                    const normalize = (value) => {
+                        try {
+                            const parsed = new URL(value);
+                            let path = parsed.pathname || '/';
+                            if (path.length > 1) path = path.replace(/\/+$/, '');
+                            return `${parsed.origin}${path}`;
+                        } catch {
+                            return value;
+                        }
+                    };
+                    const isSame = (a, b) => normalize(a) === normalize(b);
+                    const guard = (target) => {
+                        if (!isSame(lockedUrl, target)) {
+                            throw new Error('Navigation locked');
+                        }
+                    };
+                    const wrap = (fn) => function (target, ...args) {
+                        guard(target);
+                        return fn.call(this, target, ...args);
+                    };
+                    window.__VATH_LOCK_URL__ = lockedUrl;
+                    history.pushState = wrap(history.pushState);
+                    history.replaceState = wrap(history.replaceState);
+                    const loc = window.location;
+                    loc.assign = wrap(loc.assign);
+                    loc.replace = wrap(loc.replace);
+                }, originalUrl);
+            }
             
             // Set viewport
             await page.setViewport({ width: 1920, height: 1080, deviceScaleFactor: 1 });
@@ -227,49 +279,69 @@ class VathsMirror {
             const assets = new Map();
             const fontRequests = new Set();
             
-            await page.setRequestInterception(true);
-            
-            page.on('request', (request) => {
-                const resourceType = request.resourceType();
-                const requestUrl = request.url();
+            if (this.interceptRequests) {
+                await page.setRequestInterception(true);
                 
-                // Capture all resource types including animations and 3D assets
-                const captureTypes = [
-                    'image', 'font', 'stylesheet', 'script', 'xhr', 'fetch', 
-                    'media', 'other', 'document', 'manifest', 'websocket'
-                ];
-                
-                if (captureTypes.includes(resourceType)) {
-                    assets.set(requestUrl, { 
-                        type: resourceType, 
-                        captured: false,
-                        headers: request.headers()
-                    });
+                page.on('request', (request) => {
+                    const resourceType = request.resourceType();
+                    const requestUrl = request.url();
+                    const isNav = request.isNavigationRequest() && request.frame() === page.mainFrame();
+
+                    if (this.lockUrl && isNav && !isSameLockUrl(originalUrl, requestUrl)) {
+                        console.log(`[VATH] Blocking navigation to ${requestUrl} (locked to ${originalUrl})`);
+                        return request.abort();
+                    }
+                    
+                    // Capture all resource types including animations and 3D assets
+                    const captureTypes = [
+                        'image', 'font', 'stylesheet', 'script', 'xhr', 'fetch', 
+                        'media', 'other', 'document', 'manifest', 'websocket'
+                    ];
+                    
+                    if (captureTypes.includes(resourceType)) {
+                        assets.set(requestUrl, { 
+                            type: resourceType, 
+                            captured: false,
+                            headers: request.headers()
+                        });
+                    }
+                    
+                    // Detect font requests specifically
+                    if (resourceType === 'font' || 
+                        requestUrl.match(/\.(woff2?|ttf|otf|eot)$/i)) {
+                        fontRequests.add(requestUrl);
+                    }
+                    
+                    // Capture specialized web assets
+                    const pathname = new URL(requestUrl).pathname.toLowerCase();
+                    const specialExts = [
+                        '.riv', '.ktx2', '.hdr', '.glb', '.gltf', '.webp', '.avif',
+                        '.mp4', '.webm', '.wasm', '.json', '.usdz', '.obj', '.fbx',
+                        '.dae', '.3ds', '.stl', '.ply', '.xyz', '.pcd'
+                    ];
+                    
+                    if (specialExts.some(ext => pathname.endsWith(ext))) {
+                        assets.set(requestUrl, { 
+                            type: 'special', 
+                            captured: false,
+                            ext: path.extname(pathname)
+                        });
+                    }
+                    
+                    request.continue();
+                });
+            }
+
+            page.on('requestfailed', () => {
+                failedRequests += 1;
+            });
+            page.on('pageerror', () => {
+                consoleErrors += 1;
+            });
+            page.on('console', (msg) => {
+                if (msg.type && msg.type() === 'error') {
+                    consoleErrors += 1;
                 }
-                
-                // Detect font requests specifically
-                if (resourceType === 'font' || 
-                    requestUrl.match(/\.(woff2?|ttf|otf|eot)$/i)) {
-                    fontRequests.add(requestUrl);
-                }
-                
-                // Capture specialized web assets
-                const pathname = new URL(requestUrl).pathname.toLowerCase();
-                const specialExts = [
-                    '.riv', '.ktx2', '.hdr', '.glb', '.gltf', '.webp', '.avif',
-                    '.mp4', '.webm', '.wasm', '.json', '.usdz', '.obj', '.fbx',
-                    '.dae', '.3ds', '.stl', '.ply', '.xyz', '.pcd'
-                ];
-                
-                if (specialExts.some(ext => pathname.endsWith(ext))) {
-                    assets.set(requestUrl, { 
-                        type: 'special', 
-                        captured: false,
-                        ext: path.extname(pathname)
-                    });
-                }
-                
-                request.continue();
             });
 
             // Capture response bodies
@@ -296,6 +368,9 @@ class VathsMirror {
                 waitUntil: 'networkidle2', 
                 timeout: this.timeout 
             });
+            if (this.lockUrl && !isSameLockUrl(originalUrl, page.url())) {
+                console.log(`[VATH] Warning: target redirected to ${page.url()} (locked to ${originalUrl})`);
+            }
 
             // Wait for manual interaction if requested
             if (this.waitForUser) {
@@ -467,6 +542,17 @@ class VathsMirror {
             if (frameworkData.animationLibs.length > 0) {
                 console.log(`[VATH] Animation libs: ${frameworkData.animationLibs.join(', ')}`);
             }
+            const hasGsapLike = frameworkData.animationLibs.some(lib =>
+                ['gsap', 'gsap-scrolltrigger', 'lenis', 'locomotive-scroll', 'smooth-scrollbar'].includes(lib)
+            );
+            if (hasGsapLike && this.autoManualOnGsap && !this.waitForUser) {
+                console.log('[VATH] GSAP detected. Switching to manual mode.');
+                throw new Error('VATH_MANUAL_REQUIRED');
+            }
+            if (this.waitForUser && hasGsapLike) {
+                console.log('[VATH] GSAP detected. Manual interaction required.');
+                await this.waitForEnter();
+            }
 
             // Trigger lazy loading and dynamic content
             console.log('[VATH] Triggering lazy content...');
@@ -476,6 +562,26 @@ class VathsMirror {
             if (this.simulateUser) {
                 console.log('[VATH] Simulating user presence...');
                 await this.simulateHumanBehavior(page);
+            }
+
+            // Re-check for animation libs after interactions (lazy-loaded bundles)
+            if (this.autoManualOnGsap && !this.waitForUser) {
+                const lateAnimDetected = await this.safeEvaluate(page, () => {
+                    return Boolean(
+                        window.gsap ||
+                        window.ScrollTrigger ||
+                        window.Lenis ||
+                        window.lottie ||
+                        window.THREE ||
+                        window.BABYLON ||
+                        document.querySelector('[data-aos], .aos-init') ||
+                        document.querySelector('[data-scroll], [data-scroll-container]')
+                    );
+                });
+                if (lateAnimDetected) {
+                    console.log('[VATH] Animation library detected after interaction. Switching to manual mode.');
+                    throw new Error('VATH_MANUAL_REQUIRED');
+                }
             }
 
             // Wait for animations to settle
@@ -549,7 +655,7 @@ class VathsMirror {
 
             // Deep crawl if enabled
             if (this.deepCrawl && depth < this.maxDepth) {
-                const links = await this.extractLinks(page, url);
+                const links = (await this.extractLinks(page, url)) || [];
                 for (const link of links.slice(0, 5)) { // Limit to 5 links per page
                     try {
                         await this.awaken(link, depth + 1);
@@ -559,6 +665,11 @@ class VathsMirror {
                 }
             }
 
+            let domNodeCount = 0;
+            try {
+                domNodeCount = await this.safeEvaluate(page, () => document.getElementsByTagName('*').length);
+            } catch {}
+
             await browser.close();
             console.log(`[VATH] Extraction complete: ${this.outputDir}`);
             
@@ -567,7 +678,10 @@ class VathsMirror {
                 outputDir: this.outputDir,
                 framework: frameworkData.framework,
                 assetsExtracted: assetMap.size,
-                componentsDetected: components.length
+                componentsDetected: components.length,
+                failedRequests,
+                consoleErrors,
+                domNodeCount
             };
 
         } catch (error) {
@@ -581,14 +695,25 @@ class VathsMirror {
     async triggerLazyContent(page) {
         return this.safeEvaluate(page, async () => {
             // Scroll to bottom progressively
-            const scrollHeight = () => document.body.scrollHeight;
+            const root = document.scrollingElement || document.documentElement || document.body;
+            const scrollHeight = () => (root ? root.scrollHeight : 0);
             const clientHeight = () => window.innerHeight;
             let lastHeight = 0;
             let attempts = 0;
+
+            // Slow incremental scroll to trigger lazy loaders
+            for (let pass = 0; pass < 2; pass++) {
+                const maxY = scrollHeight();
+                for (let y = 0; y < maxY; y += Math.max(200, clientHeight() * 0.6)) {
+                    window.scrollTo(0, y);
+                    await new Promise(r => setTimeout(r, 700));
+                }
+                await new Promise(r => setTimeout(r, 1200));
+            }
             
             while (attempts < 10) {
                 window.scrollTo(0, scrollHeight());
-                await new Promise(r => setTimeout(r, 500));
+                await new Promise(r => setTimeout(r, 800));
                 
                 const currentHeight = scrollHeight();
                 if (currentHeight === lastHeight) break;
@@ -630,6 +755,8 @@ class VathsMirror {
             iframes.forEach(iframe => {
                 if (iframe.dataset.src) iframe.src = iframe.dataset.src;
             });
+
+            await new Promise(r => setTimeout(r, 1500));
         });
     }
 
@@ -655,7 +782,7 @@ class VathsMirror {
         });
 
         // Hover over interactive elements
-        const interactiveElements = await page.$$('a, button, [class*="hover"], [class*="interactive"]');
+        const interactiveElements = (await page.$$('a, button, [class*="hover"], [class*="interactive"]')) || [];
         for (const el of interactiveElements.slice(0, 10)) {
             try {
                 await el.hover();
@@ -723,11 +850,14 @@ class VathsMirror {
             } catch (e) {}
 
             // Extract CSS variables from root
-            const rootStyles = getComputedStyle(document.documentElement);
-            for (let i = 0; i < rootStyles.length; i++) {
-                const prop = rootStyles[i];
-                if (prop.startsWith('--')) {
-                    styles.cssVariables[prop] = rootStyles.getPropertyValue(prop).trim();
+            const rootEl = document.documentElement;
+            const rootStyles = rootEl ? getComputedStyle(rootEl) : null;
+            if (rootStyles) {
+                for (let i = 0; i < rootStyles.length; i++) {
+                    const prop = rootStyles[i];
+                    if (prop.startsWith('--')) {
+                        styles.cssVariables[prop] = rootStyles.getPropertyValue(prop).trim();
+                    }
                 }
             }
 
@@ -741,7 +871,7 @@ class VathsMirror {
                     });
                     if (shadowStyles.length > 0) {
                         styles.shadowStyles.push({
-                            host: el.tagName.toLowerCase(),
+                            host: el.tagName ? el.tagName.toLowerCase() : 'unknown',
                             index: idx,
                             styles: shadowStyles
                         });
@@ -856,7 +986,13 @@ class VathsMirror {
                 }
 
                 // Capture computed styles with all properties
-                const computed = window.getComputedStyle(node);
+                if (!(node instanceof Element)) return null;
+                let computed;
+                try {
+                    computed = window.getComputedStyle(node);
+                } catch (e) {
+                    return null;
+                }
                 const importantStyles = [
                     'display', 'position', 'top', 'right', 'bottom', 'left',
                     'width', 'height', 'margin', 'padding', 'border',
@@ -1000,13 +1136,13 @@ class VathsMirror {
             pattern.nodes.push(node);
             pattern.variations.add(JSON.stringify(node.attributes));
             
-            if (node.children) {
-                node.children.forEach(child => traverse(child, `${path}/${node.tagName}`));
-            }
-            
-            if (node.shadowRoot?.children) {
-                node.shadowRoot.children.forEach(child => traverse(child, `${path}/${node.tagName}::shadow`));
-            }
+                if (node.children) {
+                    node.children.forEach(child => traverse(child, `${path}/${node.tagName || 'node'}`));
+                }
+                
+                if (node.shadowRoot?.children) {
+                    node.shadowRoot.children.forEach(child => traverse(child, `${path}/${node.tagName || 'node'}::shadow`));
+                }
         };
 
         traverse(dom);
@@ -1075,11 +1211,13 @@ class VathsMirror {
                 const filepath = path.join(this.outputDir, 'assets', subdir, filename);
                 await fs.writeFile(filepath, asset.data);
                 
+                const basename = path.basename(parsed.pathname || '').trim();
                 assetMap.set(url, {
                     localPath: `./assets/${subdir}/${filename}`,
                     type: asset.type,
                     size: asset.data.length,
-                    contentType: asset.contentType
+                    contentType: asset.contentType,
+                    basename: basename || null
                 });
                 
             } catch (e) {
@@ -1125,7 +1263,7 @@ class VathsMirror {
         
         // Save live version (with external scripts)
         if (this.preserveLiveScripts && pageHtml) {
-            const liveHtml = this.generateLiveHTML(pageHtml, url);
+            const liveHtml = this.generateLiveHTML(pageHtml, url, assets);
             await fs.writeFile(path.join(this.outputDir, 'live.html'), liveHtml);
         }
         
@@ -1352,7 +1490,7 @@ ${list.join('\n')}
 
         // Write live.html into public/replay
         if (pageHtml) {
-            const liveHtml = this.generateLiveHTML(pageHtml, framework.sourceUrl || '');
+            const liveHtml = this.generateLiveHTML(pageHtml, framework.sourceUrl || '', assets);
             await fs.writeFile(path.join(replayDir, 'live.html'), liveHtml);
         }
 
@@ -1363,6 +1501,8 @@ ${list.join('\n')}
 
         // Write extracted styles
         await fs.writeFile(path.join(srcDir, 'extracted-styles.css'), this.compileStylesheet(styles));
+
+        // Scaffold preview disabled in UI mode
 
         // Create ScaffoldView from generated React code
         const reactCode = this.generateReactProject(framework.domSnapshot, [], assets, styles, framework);
@@ -1537,7 +1677,52 @@ export default defineConfig({
     }
 
     // Generate live HTML with original script references
-    generateLiveHTML(pageHtml, baseUrl) {
+    buildAssetRewriteScript(assetMap, relativePrefix = '../') {
+        if (!assetMap || assetMap.size === 0) return '';
+        const imageMap = {};
+        for (const [url, info] of assetMap.entries()) {
+            if (!info || !info.localPath) continue;
+            if (info.type !== 'image' && !info.contentType?.includes('image')) continue;
+            const localPath = info.localPath.replace(/^\.\//, relativePrefix);
+            if (info.basename) {
+                imageMap[info.basename] = localPath;
+            }
+            imageMap[url] = localPath;
+        }
+        const mapJson = JSON.stringify(imageMap);
+        return `
+<script>
+  (function () {
+    const map = ${mapJson};
+    const rewrite = (el) => {
+      const src = el.getAttribute('src') || '';
+      if (!src) return;
+      const key = src.split('?')[0].split('#')[0];
+      const base = key.split('/').pop();
+      if (map[key]) {
+        el.setAttribute('src', map[key]);
+        return;
+      }
+      if (base && map[base]) {
+        el.setAttribute('src', map[base]);
+      }
+    };
+    document.querySelectorAll('img[src]').forEach(rewrite);
+    const observer = new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        if (m.type === 'attributes' && m.attributeName === 'src' && m.target.tagName === 'IMG') {
+          rewrite(m.target);
+        }
+      }
+    });
+    document.querySelectorAll('img').forEach((img) => observer.observe(img, { attributes: true }));
+  })();
+</script>
+`;
+    }
+
+    // Generate live HTML with original script references
+    generateLiveHTML(pageHtml, baseUrl, assetMap) {
         const origin = new URL(baseUrl).origin;
         let html = pageHtml;
 
@@ -1556,6 +1741,8 @@ export default defineConfig({
         html = html.replace(/\\s+crossorigin=["'][^"']+["']/gi, '');
 
         // Inject auto-trigger script to nudge GSAP/ScrollTrigger/Lenis/etc.
+        const assetRewriteScript = this.buildAssetRewriteScript(assetMap, '../');
+
         const triggerScript = `
 <script>
   (function () {
@@ -1592,9 +1779,9 @@ export default defineConfig({
 </script>
 `;
         if (/<\/body>/i.test(html)) {
-            html = html.replace(/<\/body>/i, `${triggerScript}\n</body>`);
+            html = html.replace(/<\/body>/i, `${assetRewriteScript}\n${triggerScript}\n</body>`);
         } else {
-            html += triggerScript;
+            html += `${assetRewriteScript}\n${triggerScript}`;
         }
 
         return html;
@@ -2035,13 +2222,6 @@ function startUiServer({ port = 8788 } = {}) {
         job.startedAt = Date.now();
         job.logs = job.logs || [];
 
-        const mirror = new VathsMirror({
-            headless: 'new',
-            waitForUser: false,
-            deepCrawl: false,
-            maxDepth: 2
-        });
-
         const originalLog = console.log;
         const originalErr = console.error;
         console.log = (...args) => {
@@ -2056,9 +2236,21 @@ function startUiServer({ port = 8788 } = {}) {
         };
 
         try {
+            const mirror = new VathsMirror({
+                headless: 'new',
+                waitForUser: false,
+                autoManualOnGsap: false,
+                deepCrawl: false,
+                maxDepth: 2,
+                interceptRequests: true,
+                lockUrl: false
+            });
+
             await mirror.awaken(job.url);
+
             job.outputDir = mirror.outputDir;
             job.previewUrl = `/preview/${job.id}/replay/live.html`;
+            job.wrapUrl = `/wrap/${job.id}`;
 
             const zipPath = await zipReplicaReact(job.outputDir);
             job.zipPath = zipPath;
@@ -2161,6 +2353,7 @@ function startUiServer({ port = 8788 } = {}) {
                 error: job.error || null,
                 outputDir: job.outputDir || null,
                 previewUrl: job.previewUrl || null,
+                wrapUrl: job.wrapUrl || null,
                 zipUrl: job.zipUrl || null,
                 cursor: cursor + logs.length,
                 logs
@@ -2212,6 +2405,35 @@ function startUiServer({ port = 8788 } = {}) {
             } catch {
                 sendText(res, 404, 'Not found.');
             }
+            return;
+        }
+
+        if (req.method === 'GET' && pathname.startsWith('/wrap/')) {
+            const parts = pathname.split('/');
+            const id = parts[2];
+            const job = getJob(id);
+            if (!job || !job.outputDir) {
+                sendText(res, 404, 'Preview not ready.');
+                return;
+            }
+            const frameSrc = `/preview/${id}/replay/live.html`;
+            const html = `<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI - Vath Preview</title>
+    <style>
+      html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #0b0b0b; }
+      iframe { width: 100%; height: 100%; border: none; }
+    </style>
+  </head>
+  <body>
+    <iframe src="${frameSrc}" title="Preview"></iframe>
+  </body>
+</html>`;
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+            res.end(html);
             return;
         }
 

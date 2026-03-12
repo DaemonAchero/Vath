@@ -58,20 +58,43 @@ function addMessage(role, html) {
     }
   });
   meta.appendChild(copyBtn);
-  msg.appendChild(bubble);
-  msg.appendChild(meta);
+  if (role === 'assistant') {
+    const row = el('div', 'meta-row');
+    row.appendChild(meta);
+    msg.appendChild(bubble);
+    msg.appendChild(row);
+  } else {
+    msg.appendChild(bubble);
+    msg.appendChild(meta);
+  }
   chat.appendChild(msg);
   chat.scrollTop = chat.scrollHeight;
   return bubble;
 }
 
 function addAssistantBts() {
+  const intros = [
+    "Alright, I'm on it. Kicking off the replica now.",
+    "Got you. Spinning up the mirror and getting started.",
+    "Say less. I’ll handle the heavy lifting.",
+    "Okay bestie, let’s make this look good.",
+    "Cool, I’m diving in. Give me a sec.",
+    "You really picked a fun one — I’m cloning it now.",
+    "Relax, I’ve got this. Starting the extraction.",
+    "Alright champ, let’s see what this site is hiding.",
+    "Okay, okay… I’ll do it. Starting now.",
+    "Fine, I’ll be nice. Let’s clone this thing."
+  ];
+  const intro = intros[Math.floor(Math.random() * intros.length)];
   const bubble = addMessage('assistant', `
     <div class="assistant-block">
-      <div class="assistant-text">Working on the replica. Everything stays on your machine.</div>
+      <div class="assistant-text">${intro} Everything stays on your machine.</div>
       <details class="bts" open>
         <summary>Behind the scenes</summary>
         <pre id="bts-log">Boot sequence initialized...</pre>
+        <div class="typing" aria-label="Processing">
+          <span></span><span></span><span></span>
+        </div>
       </details>
       <div class="actions" data-actions style="display:none;"></div>
       <div class="preview-slot"></div>
@@ -79,28 +102,43 @@ function addAssistantBts() {
   `);
   return {
     logEl: bubble.querySelector('#bts-log'),
+    typingEl: bubble.querySelector('.typing'),
     actionsEl: bubble.querySelector('[data-actions]'),
     previewSlot: bubble.querySelector('.preview-slot')
   };
 }
 
-function addActions(container, zipUrl, previewUrl) {
+function addApologyMessage() {
+  const apologies = [
+    "Sorry about that — this site is fighting back. Want to try another one?",
+    "My bad, this one didn’t go through. Some sites block capture.",
+    "I couldn’t finish that capture. We can try a different site if you want.",
+    "Apologies — that site didn’t cooperate. Try again or pick another URL."
+  ];
+  addMessage('assistant', apologies[Math.floor(Math.random() * apologies.length)]);
+}
+
+function addActions(container, zipUrl, previewUrl, wrapUrl) {
   const { actionsEl, previewSlot } = container;
   actionsEl.style.display = 'flex';
+  const activeUrl = previewUrl;
+  const openUrl = wrapUrl ? `${wrapUrl}?t=${Date.now()}` : previewUrl;
   actionsEl.innerHTML = `
     <span class="assistant-text">Replica ready. Download the project or open the preview.</span>
-    <a href="${zipUrl}" download>Download replica-react.zip</a>
-    <a href="${previewUrl}" target="_blank" rel="noreferrer">Open live preview</a>
-    <button type="button" data-preview>Preview here</button>
+    <div class="action-row">
+      <a href="${zipUrl}" download>Download replica-react.zip</a>
+      <a href="${openUrl}" target="_blank" rel="noreferrer" data-open>Open preview</a>
+      <button type="button" data-preview>Preview here</button>
+    </div>
   `;
 
   const button = actionsEl.querySelector('[data-preview]');
+
   button.addEventListener('click', () => {
-    if (state.previewShown) return;
-    state.previewShown = true;
+    if (previewSlot.querySelector('iframe')) return;
     const frame = document.createElement('iframe');
     frame.className = 'preview-frame';
-    frame.src = previewUrl;
+    frame.src = activeUrl;
     previewSlot.appendChild(frame);
   });
 }
@@ -141,12 +179,15 @@ async function pollStatus(container) {
       state.cursor = data.cursor || state.cursor;
 
       if (data.state === 'done') {
-        addActions(container, data.zipUrl, data.previewUrl);
+        if (container.typingEl) container.typingEl.style.display = 'none';
+        addActions(container, data.zipUrl, data.previewUrl, data.wrapUrl);
         state.polling = false;
         return;
       }
       if (data.state === 'error') {
+        if (container.typingEl) container.typingEl.style.display = 'none';
         addMessage('assistant', `Something failed. <small>${data.error}</small>`);
+        addApologyMessage();
         state.polling = false;
         return;
       }
@@ -162,6 +203,10 @@ async function pollStatus(container) {
 
 composer.addEventListener('submit', async (event) => {
   event.preventDefault();
+  if (state.polling) {
+    addMessage('assistant', 'I’m still processing the current request — please wait a moment.');
+    return;
+  }
   const input = composer.querySelector('input');
   const text = input.value.trim();
   if (!text) return;
