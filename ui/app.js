@@ -4,7 +4,9 @@ const state = {
   jobId: null,
   cursor: 0,
   polling: false,
-  previewShown: false
+  previewShown: false,
+  idleTimer: null,
+  idlePrompted: false
 };
 
 function el(tag, className, html) {
@@ -69,7 +71,7 @@ function addMessage(role, html) {
   }
   chat.appendChild(msg);
   chat.scrollTop = chat.scrollHeight;
-  return bubble;
+  return { bubble, meta, msg };
 }
 
 function addAssistantBts() {
@@ -86,7 +88,7 @@ function addAssistantBts() {
     "Fine, I’ll be nice. Let’s clone this thing."
   ];
   const intro = intros[Math.floor(Math.random() * intros.length)];
-  const bubble = addMessage('assistant', `
+  const { bubble, meta } = addMessage('assistant', `
     <div class="assistant-block">
       <div class="assistant-text">${intro} Everything stays on your machine.</div>
       <details class="bts" open>
@@ -148,6 +150,55 @@ function extractUrl(text) {
   return match ? match[0] : null;
 }
 
+function normalizeText(text) {
+  return (text || '').toLowerCase().trim();
+}
+
+
+function buildCompletionNote(logText) {
+  const log = (logText || '').toString();
+  const logLower = log.toLowerCase();
+  const viewports = ['desktop', 'laptop', 'tablet', 'mobile-lg', 'mobile'];
+  const captured = viewports.filter(v => logLower.includes(`captured ${v} viewport`)).length;
+  const hasAnimations = /animation libs:/i.test(log);
+  const frameworkMatch = log.match(/framework:\s*([a-z0-9_-]+)/i);
+  const framework = frameworkMatch ? frameworkMatch[1].toUpperCase() : null;
+  const routesCaptured = (log.match(/Capturing route:/g) || []).length;
+  const hadWarnings = /warning|failed|error/i.test(log);
+
+  const shortIntros = [
+    'All set.',
+    'Done.',
+    'Good news - finished.',
+    'Completed.'
+  ];
+
+  const longIntros = [
+    "Here's what I did for this site.",
+    'Quick recap of the capture.',
+    'Summary of the mirror I just built.'
+  ];
+
+  const useLong = log.length > 1200 || routesCaptured > 0 || captured >= 4 || hasAnimations;
+  const intro = (useLong ? longIntros : shortIntros)[Math.floor(Math.random() * (useLong ? longIntros.length : shortIntros.length))];
+
+  const parts = [];
+  if (framework) parts.push(`Detected ${framework} and mirrored the structure.`);
+  else parts.push('Mirrored the structure and pulled assets/styles.');
+
+  if (captured > 0) parts.push(`Captured ${captured} responsive view${captured === 1 ? '' : 's'}.`);
+  if (hasAnimations) parts.push('Animation libraries were detected, so I nudged the page to trigger motion where possible.');
+  if (routesCaptured > 0) parts.push(`Observed ${routesCaptured} in-app route${routesCaptured === 1 ? '' : 's'} and saved snapshots.`);
+  if (hadWarnings) parts.push("If anything still looks off, it's usually a blocked or lazy-loaded asset - we can retry or force capture.");
+
+  const closing = 'You can download the replica or open the preview below.';
+
+  if (useLong) {
+    return `${intro} ${parts.join(' ')} ${closing}`.trim();
+  }
+  return `${intro} ${parts.slice(0, 2).join(' ')} ${closing}`.trim();
+}
+
 async function startClone(url, container) {
   const res = await fetch('/api/clone', {
     method: 'POST',
@@ -180,6 +231,8 @@ async function pollStatus(container) {
 
       if (data.state === 'done') {
         if (container.typingEl) container.typingEl.style.display = 'none';
+        const completionNote = buildCompletionNote(container.logEl.textContent || '');
+        addMessage('assistant', completionNote);
         addActions(container, data.zipUrl, data.previewUrl, data.wrapUrl);
         state.polling = false;
         return;
@@ -213,6 +266,14 @@ composer.addEventListener('submit', async (event) => {
 
   addMessage('user', text);
   input.value = '';
+  const normalized = normalizeText(text);
+  if (normalized.includes('what can you do') || normalized.includes('what is it') || normalized.includes('what do you do')) {
+    addMessage(
+      'assistant',
+      'I clone websites into a React replica with a live preview and a zip you can download. No database, just clean output. Drop a URL and I’ll handle the rest.'
+    );
+    return;
+  }
 
   const url = extractUrl(text);
   if (!url) {
@@ -222,6 +283,7 @@ composer.addEventListener('submit', async (event) => {
 
   const container = addAssistantBts();
   try {
+    await new Promise(r => setTimeout(r, 1200));
     await startClone(url, container);
   } catch (err) {
     addMessage('assistant', `Unable to start. <small>${err.message}</small>`);

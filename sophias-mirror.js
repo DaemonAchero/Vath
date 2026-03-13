@@ -30,6 +30,8 @@ class VathsMirror {
         this.lockUrl = options.lockUrl ?? true;
         this.interceptRequests = options.interceptRequests ?? true;
         this.autoManualOnGsap = options.autoManualOnGsap ?? false;
+        this.protocolTimeout = options.protocolTimeout || 180000;
+        this.routeCaptureLimit = options.routeCaptureLimit || 5;
         this.viewports = [
             { width: 1920, height: 1080, name: 'desktop', deviceScaleFactor: 1 },
             { width: 1366, height: 768, name: 'laptop', deviceScaleFactor: 1 },
@@ -180,6 +182,7 @@ class VathsMirror {
 
         const browser = await puppeteer.launch({
             headless: this.headless,
+            protocolTimeout: this.protocolTimeout,
             args: [
                 '--no-sandbox', 
                 '--disable-setuid-sandbox', 
@@ -245,6 +248,35 @@ class VathsMirror {
                     loc.replace = wrap(loc.replace);
                 }, originalUrl);
             }
+
+            await page.evaluateOnNewDocument(() => {
+                const seen = new Set();
+                const record = (value) => {
+                    try {
+                        const url = new URL(value, window.location.href);
+                        const href = url.href;
+                        if (!seen.has(href)) {
+                            seen.add(href);
+                            window.__VATH_ROUTES__ = window.__VATH_ROUTES__ || [];
+                            window.__VATH_ROUTES__.push(href);
+                        }
+                    } catch {}
+                };
+
+                const wrapHistory = (method) => {
+                    const original = history[method];
+                    if (!original) return;
+                    history[method] = function (state, title, url) {
+                        if (url) record(url);
+                        return original.apply(this, arguments);
+                    };
+                };
+
+                wrapHistory('pushState');
+                wrapHistory('replaceState');
+                window.addEventListener('popstate', () => record(window.location.href));
+                window.addEventListener('hashchange', () => record(window.location.href));
+            });
             
             // Set viewport
             await page.setViewport({ width: 1920, height: 1080, deviceScaleFactor: 1 });
@@ -364,10 +396,22 @@ class VathsMirror {
 
             // Navigate with extreme prejudice
             console.log('[VATH] Navigating to target...');
+            let preJsHtml = null;
+            let hydratedHtml = null;
+            let finalHtml = null;
+
+            try {
+                await page.setJavaScriptEnabled(false);
+                await page.goto(url, { waitUntil: 'domcontentloaded', timeout: this.timeout });
+                preJsHtml = await page.content();
+            } catch {}
+
+            await page.setJavaScriptEnabled(true);
             await page.goto(url, { 
                 waitUntil: 'networkidle2', 
                 timeout: this.timeout 
             });
+            hydratedHtml = await page.content();
             if (this.lockUrl && !isSameLockUrl(originalUrl, page.url())) {
                 console.log(`[VATH] Warning: target redirected to ${page.url()} (locked to ${originalUrl})`);
             }
@@ -542,6 +586,7 @@ class VathsMirror {
             if (frameworkData.animationLibs.length > 0) {
                 console.log(`[VATH] Animation libs: ${frameworkData.animationLibs.join(', ')}`);
             }
+            // Heavy-mode disabled
             const hasGsapLike = frameworkData.animationLibs.some(lib =>
                 ['gsap', 'gsap-scrolltrigger', 'lenis', 'locomotive-scroll', 'smooth-scrollbar'].includes(lib)
             );
@@ -605,8 +650,9 @@ class VathsMirror {
                 canvasData = await this.captureCanvasElements(page);
             }
 
-            // Capture full live HTML (scripts/styles intact)
-            const pageHtml = await page.content();
+            // Capture final live HTML (scripts/styles intact)
+            finalHtml = await page.content();
+            const pageHtml = finalHtml || hydratedHtml || await page.content();
 
             // Extract complete DOM with computed styles
             console.log('[VATH] Cloning DOM structure...');
@@ -630,6 +676,12 @@ class VathsMirror {
             console.log('[VATH] Analyzing component hierarchy...');
             const components = this.analyzeComponentStructure(domSnapshot);
 
+            // Capture additional SPA routes if observed
+            const observedRoutes = await this.collectObservedRoutes(page, url);
+            if (observedRoutes.length > 0) {
+                await this.captureRouteSnapshots(page, observedRoutes);
+            }
+
             // Save all assets
             console.log('[VATH] Persisting assets...');
             const assetMap = await this.saveAssets(assets, url);
@@ -641,6 +693,11 @@ class VathsMirror {
                 framework: frameworkData,
                 dom: domSnapshot,
                 pageHtml,
+                snapshots: {
+                    preJsHtml,
+                    hydratedHtml,
+                    finalHtml
+                },
                 components,
                 assets: assetMap,
                 screenshots,
@@ -1253,10 +1310,68 @@ class VathsMirror {
         }, baseUrl);
     }
 
+    async collectObservedRoutes(page, baseUrl) {
+        const baseOrigin = new URL(baseUrl).origin;
+        const routes = await this.safeEvaluate(page, () => {
+            return Array.from(new Set(window.__VATH_ROUTES__ || []));
+        }).catch(() => []);
+        return routes
+            .filter((href) => {
+                try {
+                    const url = new URL(href);
+                    return url.origin === baseOrigin;
+                } catch {
+                    return false;
+                }
+            })
+            .filter((href) => href !== baseUrl)
+            .slice(0, this.routeCaptureLimit);
+    }
+
+    async captureRouteSnapshots(page, routes) {
+        if (!routes || routes.length === 0) return;
+        const routesDir = path.join(this.outputDir, 'routes');
+        await fs.ensureDir(routesDir);
+        let index = 0;
+
+        for (const route of routes) {
+            index += 1;
+            try {
+                console.log(`[VATH] Capturing route: ${route}`);
+                await page.goto(route, { waitUntil: 'networkidle2', timeout: this.timeout });
+                const html = await page.content();
+                const htmlPath = path.join(routesDir, `route-${index}.html`);
+                await fs.writeFile(htmlPath, html);
+
+                const shotPath = path.join(routesDir, `route-${index}.png`);
+                await page.screenshot({ path: shotPath, fullPage: true, type: 'png', captureBeyondViewport: true });
+            } catch (err) {
+                console.log(`[VATH] Route capture failed: ${route} (${err.message})`);
+            }
+        }
+    }
+
     // Generate all output formats
     async generateAllOutputs(data) {
-        const { url, framework, dom, pageHtml, components, assets, screenshots, styles, webgl, canvas, storage, cookies, userAgent, viewport } = data;
+        const { url, framework, dom, pageHtml, components, assets, screenshots, styles, webgl, canvas, storage, cookies, userAgent, viewport, snapshots } = data;
         
+        const rawCss = this.compileStylesheet(styles);
+        const processedCss = await this.processStylesheet(rawCss, assets, this.outputDir);
+
+        if (snapshots && (snapshots.preJsHtml || snapshots.hydratedHtml || snapshots.finalHtml)) {
+            const snapDir = path.join(this.outputDir, 'snapshots');
+            await fs.ensureDir(snapDir);
+            if (snapshots.preJsHtml) {
+                await fs.writeFile(path.join(snapDir, 'pre-js.html'), snapshots.preJsHtml);
+            }
+            if (snapshots.hydratedHtml) {
+                await fs.writeFile(path.join(snapDir, 'hydrated.html'), snapshots.hydratedHtml);
+            }
+            if (snapshots.finalHtml) {
+                await fs.writeFile(path.join(snapDir, 'final.html'), snapshots.finalHtml);
+            }
+        }
+
         // Save raw HTML
         const rawHtml = await this.generateRawHTML(dom, assets, styles);
         await fs.writeFile(path.join(this.outputDir, 'index.html'), rawHtml);
@@ -1274,7 +1389,7 @@ class VathsMirror {
         
         // Generate React components
         if (['react', 'nextjs'].includes(framework.framework)) {
-            const reactCode = this.generateReactProject(dom, components, assets, styles, framework);
+            const reactCode = this.generateReactProject(dom, components, assets, styles, framework, processedCss);
             await fs.writeFile(path.join(this.outputDir, 'App.jsx'), reactCode.app);
             await fs.writeFile(path.join(this.outputDir, 'components.js'), reactCode.components);
             await fs.writeFile(path.join(this.outputDir, 'package.json'), JSON.stringify(reactCode.package, null, 2));
@@ -1282,32 +1397,36 @@ class VathsMirror {
         
         // Generate Vue components
         if (['vue', 'nuxtjs'].includes(framework.framework)) {
-            const vueCode = this.generateVueProject(dom, components, assets, styles, framework);
+            const vueCode = this.generateVueProject(dom, components, assets, styles, framework, processedCss);
             await fs.writeFile(path.join(this.outputDir, 'App.vue'), vueCode.app);
             await fs.writeFile(path.join(this.outputDir, 'components.vue'), vueCode.components);
         }
         
         // Generate vanilla HTML with Tailwind
-        const tailwindHtml = this.generateTailwindHTML(dom, assets, styles);
+        const tailwindHtml = this.generateTailwindHTML(dom, assets, styles, processedCss);
         await fs.writeFile(path.join(this.outputDir, 'tailwind.html'), tailwindHtml);
         
         // Save extracted styles
         await fs.writeFile(
             path.join(this.outputDir, 'extracted-styles.css'),
-            this.compileStylesheet(styles)
+            processedCss
         );
+
+        // Generate offline replay service worker
+        const swCode = this.generateReplayServiceWorker(assets);
+        await fs.writeFile(path.join(this.outputDir, 'replay-sw.js'), swCode);
         
         // Write disclaimer
         await this.writeDisclaimer(url, framework, this.outputDir);
 
         // Generate scaffold project
-        await this.generateScaffold(framework, dom, styles, assets);
+        await this.generateScaffold(framework, dom, styles, assets, processedCss);
 
         // Generate inferred component library
-        await this.generateComponentLibrary(components, styles);
+        await this.generateComponentLibrary(components, styles, processedCss);
 
         // Generate runnable React replica project
-        await this.generateReplicaReact(pageHtml, styles, assets, { framework: framework.framework, domSnapshot: dom, sourceUrl: url });
+        await this.generateReplicaReact(pageHtml, styles, assets, { framework: framework.framework, domSnapshot: dom, sourceUrl: url }, processedCss);
 
         // Save metadata
         const metadata = {
@@ -1328,6 +1447,11 @@ class VathsMirror {
             storage: {
                 localStorage: Object.keys(storage.localStorage).length,
                 sessionStorage: Object.keys(storage.sessionStorage).length
+            },
+            snapshots: {
+                preJs: Boolean(snapshots?.preJsHtml),
+                hydrated: Boolean(snapshots?.hydratedHtml),
+                final: Boolean(snapshots?.finalHtml)
             }
         };
         
@@ -1385,14 +1509,14 @@ class VathsMirror {
     }
 
     // Generate scaffold project based on framework
-    async generateScaffold(framework, dom, styles, assets) {
+    async generateScaffold(framework, dom, styles, assets, compiledCss = null) {
         const scaffoldDir = path.join(this.outputDir, 'scaffold');
         await fs.ensureDir(scaffoldDir);
 
         if (framework.framework === 'nextjs') {
             const nextDir = path.join(scaffoldDir, 'nextjs');
             await fs.ensureDir(path.join(nextDir, 'app'));
-            const reactCode = this.generateReactProject(dom, [], assets, styles, framework);
+            const reactCode = this.generateReactProject(dom, [], assets, styles, framework, compiledCss);
 
             const layout = `import './globals.css'
 
@@ -1410,7 +1534,7 @@ export default function RootLayout({ children }) {
 
             await fs.writeFile(path.join(nextDir, 'app', 'layout.tsx'), layout);
             await fs.writeFile(path.join(nextDir, 'app', 'page.tsx'), reactCode.app.replace('export default function App()', 'export default function Page()'));
-            await fs.writeFile(path.join(nextDir, 'app', 'globals.css'), this.compileStylesheet(styles));
+            await fs.writeFile(path.join(nextDir, 'app', 'globals.css'), compiledCss || this.compileStylesheet(styles));
 
             const pkg = {
                 name: 'Vath-nextjs',
@@ -1422,20 +1546,20 @@ export default function RootLayout({ children }) {
         } else if (framework.framework === 'vue' || framework.framework === 'nuxtjs') {
             const vueDir = path.join(scaffoldDir, 'vue');
             await fs.ensureDir(vueDir);
-            const vueCode = this.generateVueProject(dom, [], assets, styles, framework);
+            const vueCode = this.generateVueProject(dom, [], assets, styles, framework, compiledCss);
             await fs.writeFile(path.join(vueDir, 'App.vue'), vueCode.app);
-            await fs.writeFile(path.join(vueDir, 'extracted-styles.css'), this.compileStylesheet(styles));
+            await fs.writeFile(path.join(vueDir, 'extracted-styles.css'), compiledCss || this.compileStylesheet(styles));
         } else {
             const reactDir = path.join(scaffoldDir, 'react');
             await fs.ensureDir(reactDir);
-            const reactCode = this.generateReactProject(dom, [], assets, styles, framework);
+            const reactCode = this.generateReactProject(dom, [], assets, styles, framework, compiledCss);
             await fs.writeFile(path.join(reactDir, 'App.jsx'), reactCode.app);
-            await fs.writeFile(path.join(reactDir, 'extracted-styles.css'), this.compileStylesheet(styles));
+            await fs.writeFile(path.join(reactDir, 'extracted-styles.css'), compiledCss || this.compileStylesheet(styles));
         }
     }
 
     // Generate inferred component library
-    async generateComponentLibrary(components, styles) {
+    async generateComponentLibrary(components, styles, compiledCss = null) {
         const libDir = path.join(this.outputDir, 'library');
         await fs.ensureDir(libDir);
         await fs.ensureDir(path.join(libDir, 'components'));
@@ -1471,12 +1595,12 @@ Generated components (inferred):
 ${list.join('\n')}
 `;
         await fs.writeFile(path.join(libDir, 'README.md'), readme);
-        await fs.writeFile(path.join(libDir, 'extracted-styles.css'), this.compileStylesheet(styles));
+        await fs.writeFile(path.join(libDir, 'extracted-styles.css'), compiledCss || this.compileStylesheet(styles));
     }
 
 
     // Generate a runnable React replica project (Vite)
-    async generateReplicaReact(pageHtml, styles, assets, framework) {
+    async generateReplicaReact(pageHtml, styles, assets, framework, compiledCss = null) {
         const projDir = path.join(this.outputDir, 'replica-react');
         const srcDir = path.join(projDir, 'src');
         const pubDir = path.join(projDir, 'public');
@@ -1494,18 +1618,26 @@ ${list.join('\n')}
             await fs.writeFile(path.join(replayDir, 'live.html'), liveHtml);
         }
 
+        // Write replay service worker if available
+        try {
+            const swPath = path.join(this.outputDir, 'replay-sw.js');
+            if (await fs.pathExists(swPath)) {
+                await fs.copy(swPath, path.join(replayDir, 'sw.js'));
+            }
+        } catch {}
+
         // Copy extracted assets into public/assets
         try {
             await fs.copy(path.join(this.outputDir, 'assets'), assetsDir);
         } catch {}
 
         // Write extracted styles
-        await fs.writeFile(path.join(srcDir, 'extracted-styles.css'), this.compileStylesheet(styles));
+        await fs.writeFile(path.join(srcDir, 'extracted-styles.css'), compiledCss || this.compileStylesheet(styles));
 
         // Scaffold preview disabled in UI mode
 
         // Create ScaffoldView from generated React code
-        const reactCode = this.generateReactProject(framework.domSnapshot, [], assets, styles, framework);
+        const reactCode = this.generateReactProject(framework.domSnapshot, [], assets, styles, framework, compiledCss);
         let scaffold = reactCode.app || '';
         scaffold = scaffold.replace(/import '\.\/App\.css';\s*/g, '');
         scaffold = scaffold.replace(/export default function App\(\)/, 'export default function ScaffoldView()');
@@ -1634,6 +1766,67 @@ export default defineConfig({
         return css;
     }
 
+    buildAssetUrlMap(assetMap, relativePrefix = './') {
+        const map = {};
+        if (!assetMap || assetMap.size === 0) return map;
+        for (const [url, info] of assetMap.entries()) {
+            if (!info || !info.localPath) continue;
+            const localPath = info.localPath.replace(/^\.\//, relativePrefix);
+            if (info.basename) {
+                map[info.basename] = localPath;
+            }
+            map[url] = localPath;
+        }
+        return map;
+    }
+
+    async processStylesheet(css, assetMap, outputDir) {
+        if (!css) return css;
+        const map = this.buildAssetUrlMap(assetMap, './');
+        const urlRegex = /url\(([^)]+)\)/gi;
+        let result = '';
+        let lastIndex = 0;
+        let match;
+
+        const miscDir = path.join(outputDir, 'assets', 'misc');
+        await fs.ensureDir(miscDir);
+
+        while ((match = urlRegex.exec(css)) !== null) {
+            result += css.slice(lastIndex, match.index);
+            const raw = match[1].trim().replace(/^['"]|['"]$/g, '');
+            let replacement = raw;
+
+            if (raw.startsWith('data:')) {
+                try {
+                    const commaIndex = raw.indexOf(',');
+                    const meta = raw.slice(5, commaIndex);
+                    const data = raw.slice(commaIndex + 1);
+                    const isBase64 = meta.includes(';base64');
+                    const mime = meta.split(';')[0] || 'application/octet-stream';
+                    const ext = this.getExtensionFromMime(mime) || '.bin';
+                    const buffer = isBase64
+                        ? Buffer.from(data, 'base64')
+                        : Buffer.from(decodeURIComponent(data), 'utf8');
+                    const filename = `data-${this.generateHash(raw)}${ext}`;
+                    const filePath = path.join(miscDir, filename);
+                    await fs.writeFile(filePath, buffer);
+                    replacement = `./assets/misc/${filename}`;
+                } catch {}
+            } else {
+                const base = raw.split('?')[0].split('#')[0];
+                const basename = base.split('/').pop();
+                if (map[base]) replacement = map[base];
+                else if (map[raw]) replacement = map[raw];
+                else if (basename && map[basename]) replacement = map[basename];
+            }
+
+            result += `url("${replacement}")`;
+            lastIndex = match.index + match[0].length;
+        }
+        result += css.slice(lastIndex);
+        return result;
+    }
+
     // Generate raw HTML with inlined assets
     generateRawHTML(dom, assets, styles) {
         // Convert DOM to HTML string
@@ -1742,6 +1935,13 @@ export default defineConfig({
 
         // Inject auto-trigger script to nudge GSAP/ScrollTrigger/Lenis/etc.
         const assetRewriteScript = this.buildAssetRewriteScript(assetMap, '../');
+        const swScript = `
+<script>
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('./sw.js').catch(() => {});
+  }
+</script>
+`;
 
         const triggerScript = `
 <script>
@@ -1779,9 +1979,9 @@ export default defineConfig({
 </script>
 `;
         if (/<\/body>/i.test(html)) {
-            html = html.replace(/<\/body>/i, `${assetRewriteScript}\n${triggerScript}\n</body>`);
+            html = html.replace(/<\/body>/i, `${assetRewriteScript}\n${swScript}\n${triggerScript}\n</body>`);
         } else {
-            html += `${assetRewriteScript}\n${triggerScript}`;
+            html += `${assetRewriteScript}\n${swScript}\n${triggerScript}`;
         }
 
         return html;
@@ -1944,8 +2144,48 @@ server.listen(PORT, () => {
 `;
     }
 
+    generateReplayServiceWorker(assetMap) {
+        const files = ['.', './live.html'];
+        if (assetMap && assetMap.size) {
+            for (const info of assetMap.values()) {
+                if (info?.localPath) files.push(info.localPath);
+            }
+        }
+        const unique = Array.from(new Set(files));
+        return `const CACHE = 'vath-replay-cache';
+const PRECACHE = ${JSON.stringify(unique, null, 2)};
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open(CACHE).then((cache) => cache.addAll(PRECACHE)).catch(() => {})
+  );
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys().then((keys) => Promise.all(keys.map((key) => key !== CACHE ? caches.delete(key) : null)))
+  );
+});
+
+self.addEventListener('fetch', (event) => {
+  const url = new URL(event.request.url);
+  if (url.origin !== location.origin) return;
+  event.respondWith(
+    caches.match(event.request).then((cached) => {
+      if (cached) return cached;
+      return fetch(event.request).then((response) => {
+        const clone = response.clone();
+        caches.open(CACHE).then((cache) => cache.put(event.request, clone)).catch(() => {});
+        return response;
+      }).catch(() => cached);
+    })
+  );
+});
+`;
+    }
+
     // Generate React project structure
-    generateReactProject(dom, components, assets, styles, framework) {
+    generateReactProject(dom, components, assets, styles, framework, compiledCss = null) {
         const convertToJSX = (node, depth = 0) => {
             if (!node) return '';
             if (node.nodeType === 3) {
@@ -2019,7 +2259,7 @@ export default function App() {
 }
 `;
 
-        const stylesCode = this.compileStylesheet(styles);
+        const stylesCode = compiledCss || this.compileStylesheet(styles);
         
         const packageJson = {
             name: "Vath-extracted",
@@ -2049,7 +2289,7 @@ export default function App() {
     }
 
     // Generate Vue project structure
-    generateVueProject(dom, components, assets, styles, framework) {
+    generateVueProject(dom, components, assets, styles, framework, compiledCss = null) {
         const convertToVue = (node) => {
             if (!node) return '';
             if (node.nodeType === 3) {
@@ -2105,7 +2345,7 @@ export default {
 </script>
 
 <style scoped>
-\${this.compileStylesheet(styles)}
+\${compiledCss || this.compileStylesheet(styles)}
 </style>
 `;
 
@@ -2116,7 +2356,7 @@ export default {
     }
 
     // Generate Tailwind HTML
-    generateTailwindHTML(dom, assets, styles) {
+    generateTailwindHTML(dom, assets, styles, compiledCss = null) {
         const convertToHTML = (node) => {
             if (!node) return '';
             if (node.nodeType === 3) return node.textContent || '';
@@ -2144,7 +2384,7 @@ export default {
     <title>Vath's Mirror - Tailwind</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        \${this.compileStylesheet(styles)}
+        \${compiledCss || this.compileStylesheet(styles)}
     </style>
 </head>
 <body>
@@ -2255,7 +2495,6 @@ function startUiServer({ port = 8788 } = {}) {
             const zipPath = await zipReplicaReact(job.outputDir);
             job.zipPath = zipPath;
             job.zipUrl = `/download/${job.id}`;
-
             job.state = 'done';
             job.finishedAt = Date.now();
         } catch (err) {
