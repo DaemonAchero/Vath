@@ -1,4 +1,5 @@
 {
+  "name": "vath",
   "dependencies": {
     "fs-extra": "^11.3.4",
     "puppeteer": "^24.39.0",

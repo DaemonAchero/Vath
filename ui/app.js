@@ -20,7 +20,7 @@ const shell = el('div', 'shell');
 const header = el('div', 'brand');
 header.innerHTML = `
   <div>
-    <h1>AI - Vath</h1>
+    <h1>Vath</h1>
   </div>
 `;
 

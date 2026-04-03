@@ -11,7 +11,53 @@ const execPromise = util.promisify(exec);
 
 puppeteer.use(StealthPlugin());
 
-class VathsMirror {
+function loadEnvFile(envPath = path.join(__dirname, '.env')) {
+    if (!fs.existsSync(envPath)) return;
+
+    const content = fs.readFileSync(envPath, 'utf8');
+    for (const rawLine of content.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith('#')) continue;
+
+        const eqIndex = line.indexOf('=');
+        if (eqIndex === -1) continue;
+
+        const key = line.slice(0, eqIndex).trim();
+        let value = line.slice(eqIndex + 1).trim();
+        if (!key) continue;
+
+        if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+            value = value.slice(1, -1);
+        }
+
+        if (process.env[key] === undefined) {
+            process.env[key] = value;
+        }
+    }
+}
+
+loadEnvFile();
+
+function getBrowserExecutablePath() {
+    const envPath = process.env.CHROME_PATH?.trim();
+    if (envPath) return envPath;
+
+    if (process.platform === 'win32') {
+        const candidates = [
+            'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+            'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+            path.join(process.env.LOCALAPPDATA || '', 'Google\\Chrome\\Application\\chrome.exe')
+        ].filter(Boolean);
+
+        for (const candidate of candidates) {
+            if (fs.existsSync(candidate)) return candidate;
+        }
+    }
+
+    return undefined;
+}
+
+class VathMirror {
     constructor(options = {}) {
         this.outputDir = options.outputDir || path.join(os.tmpdir(), `ai-vath-extracted-${Date.now()}`);
         this.timeout = options.timeout || 120000;
@@ -183,6 +229,7 @@ class VathsMirror {
         const browser = await puppeteer.launch({
             headless: this.headless,
             protocolTimeout: this.protocolTimeout,
+            executablePath: getBrowserExecutablePath(),
             args: [
                 '--no-sandbox', 
                 '--disable-setuid-sandbox', 
@@ -2476,7 +2523,7 @@ function startUiServer({ port = 8788 } = {}) {
         };
 
         try {
-            const mirror = new VathsMirror({
+            const mirror = new VathMirror({
                 headless: 'new',
                 waitForUser: false,
                 autoManualOnGsap: false,
@@ -2661,7 +2708,7 @@ function startUiServer({ port = 8788 } = {}) {
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>AI - Vath Preview</title>
+    <title>Vath Preview</title>
     <style>
       html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #0b0b0b; }
       iframe { width: 100%; height: 100%; border: none; }
@@ -2704,7 +2751,7 @@ if (flags.has('--ui')) {
 
 if (!url) {
     console.log(`
-[VATH] Usage: node Vaths-mirror.js <url> [options]
+[VATH] Usage: node vath.js <url> [options]
 
 Options:
   --headed          Run with visible browser window
@@ -2716,10 +2763,10 @@ Options:
   --port <n>        Port for UI server (default: 8788)
 
 Examples:
-  node Vaths-mirror.js https://example.com
-  node Vaths-mirror.js https://example.com --headed --wait
-  node Vaths-mirror.js https://example.com --deep --max-depth 2
-  node Vaths-mirror.js --ui --port 8788
+  node vath.js https://example.com
+  node vath.js https://example.com --headed --wait
+  node vath.js https://example.com --deep --max-depth 2
+  node vath.js --ui --port 8788
 `);
     process.exit(1);
 }
@@ -2737,7 +2784,7 @@ const options = {
 
 
 
-const mirror = new VathsMirror(options);
+const mirror = new VathMirror(options);
 mirror.awaken(url).then(() => {
     console.log(`[VATH] Ritual complete. Output: \${mirror.outputDir}`);
     process.exit(0);
