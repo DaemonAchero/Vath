@@ -142,4 +142,4 @@ If `npm install` fails, run it again after checking your network and local npm c
 4. Run `node vath.js --ui --port 3000`
 
 ## Limitations
-May not fully work to some sites and is under development of caputuring all endpoints for full lages extractions
+May not fully work to some sites and is under development of caputuring all endpoints for full site extractions
