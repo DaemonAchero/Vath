@@ -9,11 +9,13 @@ This project is designed to stay on your machine. It launches a browser locally,
 Vath can:
 
 - open a target website in an automated browser
-- capture HTML, styles, scripts, images, fonts, media, and other assets
+- capture HTML, or any frontend site with styles, scripts, images, fonts, media, and other assets
 - extract responsive views
 - optionally crawl deeper links
 - generate a local preview UI
 - package the result for download
+work with almost any modern sites especially award winning websites
+
 
 ## Requirements
 
@@ -139,3 +141,5 @@ If `npm install` fails, run it again after checking your network and local npm c
 3. Set `CHROME_PATH` to your local Chrome executable
 4. Run `node vath.js --ui --port 3000`
 
+## Limitations
+May not fully work to some sites and is under development of caputuring all endpoints for full lages extractions
